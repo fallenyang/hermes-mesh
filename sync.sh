@@ -312,7 +312,6 @@ if [ -d "$SKILLS_SRC" ] && [ -d "$SKILLS_DST" ]; then
     CONFLICTS=$(comm -12 "$REMOTE_CHANGED" "$LOCAL_CHANGED" 2>/dev/null || true)
     if [ -n "$CONFLICTS" ]; then
         if $RESOLVE_SKILLS; then
-            local conflict_count
             conflict_count=$(echo "$CONFLICTS" | grep -c .)
             log "  ⤷ auto-resolved $conflict_count skill conflict(s) — kept local versions"
             echo -e "\033[32m✓ Auto-resolved $conflict_count skill conflict(s)\033[0m — local versions kept" >&2
