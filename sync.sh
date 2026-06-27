@@ -5,9 +5,10 @@ set -euo pipefail
 FORCE_PULL=false
 FORCE_PUSH=false
 DRY_RUN=false
+RESOLVE_SKILLS=false
 
 usage() {
-    echo "Usage: sync.sh [--force-pull | --force-push | --dry-run]"
+    echo "Usage: sync.sh [--force-pull | --force-push | --dry-run | --resolve-skills]"
     echo ""
     echo "  (no flag)    Normal sync: pull, 3-way merge, export, push"
     echo "  --force-pull  Discard ALL local changes — overwrite live memory + skills"
@@ -16,16 +17,20 @@ usage() {
     echo "                memory + skills. Use when remote is stale/corrupt."
     echo "  --dry-run     Report what would change (skills conflicts, memory diffs)"
     echo "                without modifying anything. Safe for inspection."
+    echo "  --resolve-skills  Auto-resolve skill conflicts by keeping local version."
+    echo "                Suppresses conflict warnings and continues with export+push."
+    echo "                Pair with --force-pull on other machines afterward."
     exit 1
 }
 
 for arg in "$@"; do
     case "$arg" in
-        --force-pull) FORCE_PULL=true ;;
-        --force-push) FORCE_PUSH=true ;;
-        --dry-run)    DRY_RUN=true ;;
-        -h|--help)    usage ;;
-        *)            echo "Unknown flag: $arg"; usage ;;
+        --force-pull)     FORCE_PULL=true ;;
+        --force-push)     FORCE_PUSH=true ;;
+        --dry-run)        DRY_RUN=true ;;
+        --resolve-skills) RESOLVE_SKILLS=true ;;
+        -h|--help)        usage ;;
+        *)                echo "Unknown flag: $arg"; usage ;;
     esac
 done
 
@@ -306,17 +311,26 @@ if [ -d "$SKILLS_SRC" ] && [ -d "$SKILLS_DST" ]; then
     sort -o "$LOCAL_CHANGED" "$LOCAL_CHANGED" 2>/dev/null || true
     CONFLICTS=$(comm -12 "$REMOTE_CHANGED" "$LOCAL_CHANGED" 2>/dev/null || true)
     if [ -n "$CONFLICTS" ]; then
-        warn "skill-conflict"
-        log "  ⤷ FILES CHANGED ON BOTH SIDES — manual consolidation needed:"
-        while IFS= read -r f; do [ -n "$f" ] && log "    $f"; done <<< "$CONFLICTS"
-        echo "" >&2
-        echo -e "\033[31m⚠️  SKILL CONFLICTS\033[0m — files changed on both $MACHINE and remote:" >&2
-        while IFS= read -r f; do [ -n "$f" ] && echo -e "   \033[31m$f\033[0m" >&2; done <<< "$CONFLICTS"
-        echo -e "\033[33m→ Local version kept. To resolve one-sidedly:\033[0m" >&2
-        echo -e "\033[33m   1. sync.sh --force-push  on the machine whose version should win\033[0m" >&2
-        echo -e "\033[33m   2. sync.sh --force-pull  on the other machine\033[0m" >&2
-        echo "" >&2
-        echo "" >&2
+        if $RESOLVE_SKILLS; then
+            local conflict_count
+            conflict_count=$(echo "$CONFLICTS" | grep -c .)
+            log "  ⤷ auto-resolved $conflict_count skill conflict(s) — kept local versions"
+            echo -e "\033[32m✓ Auto-resolved $conflict_count skill conflict(s)\033[0m — local versions kept" >&2
+            echo -e "\033[33m  Run --force-pull on other machines to propagate.\033[0m" >&2
+            echo "" >&2
+        else
+            warn "skill-conflict"
+            log "  ⤷ FILES CHANGED ON BOTH SIDES — manual consolidation needed:"
+            while IFS= read -r f; do [ -n "$f" ] && log "    $f"; done <<< "$CONFLICTS"
+            echo "" >&2
+            echo -e "\033[31m⚠️  SKILL CONFLICTS\033[0m — files changed on both $MACHINE and remote:" >&2
+            while IFS= read -r f; do [ -n "$f" ] && echo -e "   \033[31m$f\033[0m" >&2; done <<< "$CONFLICTS"
+            echo -e "\033[33m→ Local version kept. To resolve one-sidedly:\033[0m" >&2
+            echo -e "\033[33m   1. sync.sh --resolve-skills  on the machine whose version should win\033[0m" >&2
+            echo -e "\033[33m   2. sync.sh --force-pull  on the other machine\033[0m" >&2
+            echo "" >&2
+            echo "" >&2
+        fi
     fi
 
     if $DRY_RUN; then

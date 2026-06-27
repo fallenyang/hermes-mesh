@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.2 — 2026-06-27
+
+### Added
+- `sync.sh --resolve-skills` flag — auto-resolves skill conflicts by keeping local versions (suppresses warnings, logs resolution count). Pair with `--force-pull` on other machines.
+
+### Fixed
+- `setup.sh` now exports actual memory content during bootstrap — if `MEMORY.md` or `USER.md` already have real data, they're copied into the worktree instead of being replaced with empty placeholders. Prevents memory loss on first sync.
+
 ## 1.0.1 — 2026-06-06
 
 ### Fixes (peer review)

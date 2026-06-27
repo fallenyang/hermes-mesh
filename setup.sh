@@ -270,6 +270,16 @@ seed_worktree() {
     [ -s "$HERMES_HOME/memories/MEMORY.md" ]     || echo "# Durable Memory" > "$HERMES_HOME/memories/MEMORY.md"
     [ -s "$HERMES_HOME/memories/USER.md" ]       || echo "# User Profile" > "$HERMES_HOME/memories/USER.md"
 
+    # Export actual memory content into worktree if live files have real data
+    if [ -s "$HERMES_HOME/memories/MEMORY.md" ] && grep -q '§' "$HERMES_HOME/memories/MEMORY.md" 2>/dev/null; then
+        cp "$HERMES_HOME/memories/MEMORY.md" "$WORKTREE/memory/agent-memory.md"
+        ok "exported existing agent memory to worktree"
+    fi
+    if [ -s "$HERMES_HOME/memories/USER.md" ] && grep -q '[a-zA-Z]' "$HERMES_HOME/memories/USER.md" 2>/dev/null; then
+        cp "$HERMES_HOME/memories/USER.md" "$WORKTREE/memory/user-profile.md"
+        ok "exported existing user profile to worktree"
+    fi
+
     cd "$WORKTREE"
     local commit_err
     commit_err=$(mktemp)

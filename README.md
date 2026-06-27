@@ -82,6 +82,8 @@ This preference applies everywhere — no tag needed
 | `bash sync.sh` | Manual sync cycle (cron runs this automatically) |
 | `bash sync.sh --force-push` | Overwrite bare repo with local (step 1 of 2 for conflict resolution) |
 | `bash sync.sh --force-pull` | Overwrite local with bare repo (step 2 of 2 for conflict resolution) |
+| `bash sync.sh --resolve-skills` | Auto-resolve skill conflicts by keeping local versions (then force-pull other machines) |
+| `bash sync.sh --dry-run` | Preview what would change without modifying anything |
 | `bash sync.sh --squash` | Collapse >50 commits into one (run monthly to keep history clean) |
 | `bash update.sh` | Pull latest scripts from upstream — shows version diff + recent CHANGELOG entries before asking |
 | `bash test.sh` | Run the test suite (47 tests: setup, merge, sync, uninstall, edge cases) |
@@ -177,7 +179,7 @@ Versioning follows [Keep a Changelog](https://keepachangelog.com/). Release tags
 
 - **Export before import** — local edits are never destroyed by a stale remote copy
 - **No silent failures** — every error is captured to the log with diagnostics
-- **Skills conflicts** — warn in red with `--force-push`/`--force-pull` hint, don't block, local version wins. Use `--dry-run` to preview what would be lost before syncing.
+- **Skills conflicts** — warn in red with `--resolve-skills` / `--force-pull` hint, don't block, local version wins. Run `sync.sh --resolve-skills` to suppress warnings and auto-accept local versions, then `--force-pull` on other machines. Use `--dry-run` to preview what would be lost before syncing.
 - **Three-way memory merge** — `§`-entry diffing, LLM only when both sides disagree
 - **Coordinator SPOF** — workers degrade gracefully (warn + continue), but skills/memory drift until coordinator returns. Run a coordinator on an always-on machine.
 - **LLM conflicts** — sequential, 120s timeout per conflict. Worst case N × 120s. In practice, conflicts are rare (only when both sides edit the same entry differently).
