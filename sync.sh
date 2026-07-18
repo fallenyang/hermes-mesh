@@ -422,7 +422,20 @@ else
     fi
 fi
 
-find "$HERMES_HOME/knowledge-sync-backups" -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+# Keep only recent knowledge-sync skill backups.  A 7-day retention at
+# 15-minute cadence produced hundreds of full skill-tree copies and filled
+# the VPS disk, which in turn broke Hermes.  Keep the latest 16 runs (~4h)
+# instead; source of truth is the git-backed mesh repository.
+python3 - "$HERMES_HOME/knowledge-sync-backups" <<PY 2>/dev/null || true
+from pathlib import Path
+import shutil, sys
+base = Path(sys.argv[1])
+if not base.exists():
+    raise SystemExit
+entries = sorted([p for p in base.iterdir() if p.is_dir() and p.name.startswith("skills-")], key=lambda p: p.name)
+for p in entries[:-16]:
+    shutil.rmtree(p)
+PY
 
 # ── periodic history squash (manual: sync.sh --squash) ────────
 if [ "${1:-}" = "--squash" ]; then
