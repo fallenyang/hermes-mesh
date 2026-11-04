@@ -56,7 +56,21 @@ echo "===================="
 echo ""
 
 # ── source directory ───────────────────────────────────────────
-if [ ! -t 0 ]; then
+# Prefer the scripts sitting next to this file. The old rule was "stdin is not
+# a TTY → clone from GitHub", which meant `bash setup.sh < answers` (automation,
+# CI, the test suite) silently seeded the worktree from upstream instead of the
+# version actually being run. Cloning is only correct for `curl | bash`, where
+# there is no script file on disk at all.
+_self_src=""
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    _self_src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+
+if [ -n "${HERMES_MESH_SOURCE_DIR:-}" ] && [ -f "$HERMES_MESH_SOURCE_DIR/setup.sh" ]; then
+    SCRIPT_DIR="$HERMES_MESH_SOURCE_DIR"
+elif [ -n "$_self_src" ] && [ -f "$_self_src/setup.sh" ] && [ -f "$_self_src/sync.sh" ]; then
+    SCRIPT_DIR="$_self_src"
+elif [ ! -t 0 ]; then
     SCRIPT_DIR=$(mktemp -d)
     trap 'rm -rf "'"$SCRIPT_DIR"'"' EXIT
     git clone --depth 1 https://github.com/B1Z0N/hermes-mesh.git "$SCRIPT_DIR" 2>/dev/null || {
@@ -66,6 +80,27 @@ if [ ! -t 0 ]; then
 else
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 fi
+
+# ── scheduler capability detection ────────────────────────────
+# A crontab binary is not proof that anything will run it. On Arch/CachyOS
+# systems cron is frequently absent or its daemon disabled, so the old check
+# ("crontab exists → schedule the job") installed a job that never fired.
+cron_running() {
+    command -v crontab >/dev/null 2>&1 || return 1
+    local u
+    for u in cron crond cronie; do
+        systemctl is-active --quiet "$u" >/dev/null 2>&1 && return 0
+    done
+    pgrep -x cron  >/dev/null 2>&1 && return 0
+    pgrep -x crond >/dev/null 2>&1 && return 0
+    return 1
+}
+
+systemd_user_usable() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl --user show-environment >/dev/null 2>&1 || return 1
+    return 0
+}
 
 # ── prerequisites ──────────────────────────────────────────────
 echo "Checking prerequisites..."
@@ -78,8 +113,10 @@ if ! python3 -c "import tomllib" 2>/dev/null && ! python3 -c "import tomli" 2>/d
     missing="$missing  tomli — pip install tomli (or use Python 3.11+ which bundles tomllib)\n"
 fi
 if [ "$(uname -s)" != "Darwin" ]; then
-    command -v crontab &>/dev/null || \
-        missing="$missing  crontab — apt install cron / yum install cronie\n"
+    # Either scheduler is acceptable: a running cron, or systemd user timers.
+    if ! command -v crontab &>/dev/null && ! systemd_user_usable; then
+        missing="$missing  cron or systemd --user — apt install cron / pacman -S cronie\n"
+    fi
 fi
 if [ -n "$missing" ]; then
     echo ""
@@ -340,13 +377,70 @@ EOF
     launchctl load "$PLIST" 2>/dev/null || true
     ok "launchd installed (~/Library/LaunchAgents/com.hermes.mesh-sync.plist)"
 else
-    CRON_JOB="*/$INTERVAL * * * * bash \"$WORKTREE/sync.sh\"  # hermes-mesh-sync"
-    TMP_CRON=$(mktemp)
-    crontab -l 2>/dev/null | grep -v "# hermes-mesh-sync" > "$TMP_CRON" || true
-    echo "$CRON_JOB" >> "$TMP_CRON"
-    crontab "$TMP_CRON" 2>/dev/null || fail "crontab install failed"
-    rm -f "$TMP_CRON"
-    ok "cron installed (every ${INTERVAL}m)"
+    # Prefer whichever scheduler will actually run. HERMES_MESH_SCHEDULER can
+    # force cron|systemd for reproducible installs and test runs.
+    SCHEDULER_MODE="${HERMES_MESH_SCHEDULER:-auto}"
+    case "$SCHEDULER_MODE" in
+        cron)    USE_CRON=true ;;
+        systemd) USE_CRON=false ;;
+        auto)
+            if cron_running; then
+                USE_CRON=true
+            elif systemd_user_usable; then
+                USE_CRON=false
+                warn "no running cron daemon — using a systemd user timer instead"
+            else
+                fail "No usable scheduler: cron is not running and 'systemctl --user' is unavailable.
+       Fix one of them and re-run:
+         apt install cron && systemctl enable --now cron     (Debian/Ubuntu)
+         pacman -S cronie && systemctl enable --now cronie   (Arch/CachyOS)"
+            fi
+            ;;
+        *) fail "HERMES_MESH_SCHEDULER must be cron, systemd or auto (got: $SCHEDULER_MODE)" ;;
+    esac
+
+    if $USE_CRON; then
+        CRON_JOB="*/$INTERVAL * * * * bash \"$WORKTREE/sync.sh\"  # hermes-mesh-sync"
+        TMP_CRON=$(mktemp)
+        crontab -l 2>/dev/null | grep -v "# hermes-mesh-sync" > "$TMP_CRON" || true
+        echo "$CRON_JOB" >> "$TMP_CRON"
+        crontab "$TMP_CRON" 2>/dev/null || fail "crontab install failed"
+        rm -f "$TMP_CRON"
+        ok "cron installed (every ${INTERVAL}m)"
+    else
+        UNIT_DIR="$HOME/.config/systemd/user"
+        mkdir -p "$UNIT_DIR"
+        cat > "$UNIT_DIR/hermes-mesh-sync.service" << EOF
+[Unit]
+Description=Hermes Mesh sync ($MACHINE_NAME)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env bash "$WORKTREE/sync.sh"
+EOF
+        cat > "$UNIT_DIR/hermes-mesh-sync.timer" << EOF
+[Unit]
+Description=Hermes Mesh sync every ${INTERVAL} minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${INTERVAL}min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+        systemctl --user daemon-reload 2>/dev/null || true
+        if systemctl --user enable --now hermes-mesh-sync.timer 2>/dev/null; then
+            ok "systemd user timer installed (every ${INTERVAL}m)"
+            # Without linger the timer stops when the last session ends.
+            if ! loginctl show-user "$USER" 2>/dev/null | grep -q 'Linger=yes'; then
+                warn "lingering is off — timer stops at logout. Run: loginctl enable-linger $USER"
+            fi
+        else
+            fail "systemd user timer install failed (units are in $UNIT_DIR)"
+        fi
+    fi
 fi
 
 # ── auto-tagging seed ─────────────────────────────────────────

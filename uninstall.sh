@@ -114,6 +114,14 @@ if [ "$(uname -s)" = "Darwin" ]; then
         ok "launchd job removed"
     fi
 else
+    # systemd user timer — installed by setup.sh when no cron daemon is running
+    UNIT_DIR="$HOME/.config/systemd/user"
+    if [ -f "$UNIT_DIR/hermes-mesh-sync.timer" ]; then
+        systemctl --user disable --now hermes-mesh-sync.timer 2>/dev/null || true
+        rm -f "$UNIT_DIR/hermes-mesh-sync.timer" "$UNIT_DIR/hermes-mesh-sync.service"
+        systemctl --user daemon-reload 2>/dev/null || true
+        ok "systemd user timer removed"
+    fi
     TMP_CRON=$(mktemp)
     if crontab -l 2>/dev/null | grep -v "# hermes-mesh-sync" > "$TMP_CRON"; then
         crontab "$TMP_CRON"
