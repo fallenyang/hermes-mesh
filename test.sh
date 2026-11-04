@@ -469,6 +469,35 @@ test_sync_failed_rebase_preserves_memory() {
         "remote entry was merged in"
 }
 
+# ── regression: a machine with less memory must not delete the hub's ──
+# When a machine is already up to date, the merge base equals the remote side,
+# so every hub entry missing from that machine's live memory reads as a local
+# deletion and gets pushed to the whole fleet. A fresh machine joining the mesh
+# truncated USER.md this way across three workers.
+test_sync_up_to_date_keeps_remote_entries() {
+    echo -e "\n${BOLD}── sync: up-to-date machine must not delete hub entries (regression)${NC}"
+    setup_test_env "sync-trunc"
+    local home="$TEST_HOME/sync-trunc"
+    local bare="$home/git/hermes-mesh.git"
+    local wt="$home/hermes-mesh"
+    run_setup "$home" "coordinator" "box" "$wt" "60" "n"
+
+    # Hub holds three entries.
+    printf 'shared one\n§\nshared two\n§\nshared three\n' > "$wt/memory/agent-memory.md"
+    ( cd "$wt" && git add -A && git -c user.email=t@t -c user.name=t commit -qm "hub memory" && git push -q origin main ) >/dev/null 2>&1
+
+    # Local live memory knows only ONE of them (a machine that just joined).
+    printf 'shared one\n' > "$home/.hermes/memories/MEMORY.md"
+
+    ( cd "$wt" && HOME="$home" bash sync.sh ) >/dev/null 2>&1 || true
+
+    local live; live=$(cat "$home/.hermes/memories/MEMORY.md")
+    assert_contains "$live" "shared two"   "hub entry 'shared two' survived"
+    assert_contains "$live" "shared three" "hub entry 'shared three' survived"
+    assert_contains "$(cd "$wt" && git show HEAD:memory/agent-memory.md)" "shared three" \
+        "hub entry not deleted from the repo"
+}
+
 # ── regression: merge guard restores entries ───────────────────
 test_merge_ensure_contains() {
     echo -e "\n${BOLD}── merge: --ensure-contains restores dropped entries${NC}"
@@ -629,6 +658,7 @@ run_section sync test_sync_force_pull
 run_section sync test_sync_mutually_exclusive_flags
 run_section sync test_sync_dry_run_no_crash
 run_section sync test_sync_failed_rebase_preserves_memory
+run_section sync test_sync_up_to_date_keeps_remote_entries
 
 run_section uninstall test_uninstall_coordinator
 run_section uninstall test_uninstall_abort

@@ -272,6 +272,25 @@ fi
 # Memory merge. Prefer the true common ancestor; OLD_HEAD is only a fallback
 # for the rare case where no merge base exists at all.
 MERGE_BASE="${MEMORY_MERGE_BASE:-${OLD_HEAD:-$(git rev-parse HEAD)}}"
+
+# Restore entries the merge tried to drop. Run against BOTH sides: a machine
+# whose live memory is merely smaller than the hub would otherwise read every
+# hub entry as a deliberate local deletion and push that deletion to everyone.
+_memory_guard() {  # infile require out label
+    local _log; _log=$(mktemp)
+    if python3 "$WT/memory-merge.py" --machine "$MACHINE" --ensure-contains \
+            --infile "$1" --require "$2" --out "$3" >"$_log" 2>&1; then
+        cat "$_log" >> "$LOG"
+        local _n; _n=$(grep -oP 'DROPPED=\K\d+' "$_log" 2>/dev/null | head -1 || true)
+        if [ "${_n:-0}" -gt 0 ]; then
+            warn "memory-drop-prevented:$4($_n)"
+        fi
+        rm -f "$_log"; return 0
+    fi
+    warn "memory-guard-failed:$4"
+    cat "$_log" >> "$LOG"; rm -f "$_log"; return 1
+}
+
 for PAIR in "MEMORY.md:memory/agent-memory.md" "USER.md:memory/user-profile.md"; do
     LIVE_NAME="${PAIR%%:*}"
     WT_REL="${PAIR##*:}"
@@ -285,42 +304,37 @@ for PAIR in "MEMORY.md:memory/agent-memory.md" "USER.md:memory/user-profile.md";
     log "MERGE $LIVE_NAME"
     MERGED_TMP=$(mktemp)
     MERGE_LOG=$(mktemp)
+    # Snapshot the remote side before the merge touches it: entries the hub
+    # currently holds must not be deleted by a machine that simply has less.
+    WT_SNAPSHOT=$(mktemp)
+    cp "$WT_FILE" "$WT_SNAPSHOT" 2>/dev/null || true
     if python3 "$WT/memory-merge.py" --machine "$MACHINE" --base "$BASE_TMP" --ours "$LIVE" --theirs "$WT_FILE" --out "$MERGED_TMP" >"$MERGE_LOG" 2>&1; then
         cat "$MERGE_LOG" >> "$LOG"
         if grep -qP 'FALLBACKS=[1-9]' "$MERGE_LOG"; then
             N=$(grep -oP 'FALLBACKS=\K\d+' "$MERGE_LOG" || echo "?")
             warn "llm-fallback:$LIVE_NAME($N)"
         fi
-        # Guard: nothing present in live memory may vanish because of this run.
-        # A stale merge base (or a history rewrite that leaves none) makes the
-        # merge read a local-only entry as a remote deletion; this restores it.
-        GUARDED_TMP=$(mktemp)
-        GUARD_LOG=$(mktemp)
-        if python3 "$WT/memory-merge.py" --machine "$MACHINE" --ensure-contains \
-                --infile "$MERGED_TMP" --require "$LIVE" --out "$GUARDED_TMP" >"$GUARD_LOG" 2>&1; then
-            cat "$GUARD_LOG" >> "$LOG"
-            DROPPED_N=$(grep -oP 'DROPPED=\K\d+' "$GUARD_LOG" 2>/dev/null | head -1 || true)
-            if [ "${DROPPED_N:-0}" -gt 0 ]; then
-                warn "memory-drop-prevented:$LIVE_NAME($DROPPED_N)"
-            fi
-            diff -q "$GUARDED_TMP" "$WT_FILE" >/dev/null 2>&1 || cp "$GUARDED_TMP" "$WT_FILE"
+        # Guard both directions — see _memory_guard.
+        G1_TMP=$(mktemp)
+        G2_TMP=$(mktemp)
+        if _memory_guard "$MERGED_TMP" "$LIVE" "$G1_TMP" "$LIVE_NAME/local" \
+           && _memory_guard "$G1_TMP" "$WT_SNAPSHOT" "$G2_TMP" "$LIVE_NAME/remote"; then
+            diff -q "$G2_TMP" "$WT_FILE" >/dev/null 2>&1 || cp "$G2_TMP" "$WT_FILE"
             FILTERED_TMP=$(mktemp)
-            if python3 "$WT/memory-merge.py" --filter --machine "$MACHINE" --infile "$GUARDED_TMP" --out "$FILTERED_TMP"; then
+            if python3 "$WT/memory-merge.py" --filter --machine "$MACHINE" --infile "$G2_TMP" --out "$FILTERED_TMP"; then
                 diff -q "$FILTERED_TMP" "$LIVE" >/dev/null 2>&1 || cp "$FILTERED_TMP" "$LIVE"
             fi
             rm -f "$FILTERED_TMP"
         else
-            # Guard unavailable — refuse to rewrite live memory from a merge we
+            # A guard failed — refuse to rewrite live memory from a merge we
             # could not verify. The worktree still gets the merged version.
-            warn "memory-guard-failed:$LIVE_NAME"
-            cat "$GUARD_LOG" >> "$LOG"
             diff -q "$MERGED_TMP" "$WT_FILE" >/dev/null 2>&1 || cp "$MERGED_TMP" "$WT_FILE"
         fi
-        rm -f "$GUARDED_TMP" "$GUARD_LOG"
+        rm -f "$G1_TMP" "$G2_TMP"
     else
         warn "merge-failed:$LIVE_NAME"
     fi
-    rm -f "$MERGED_TMP" "$BASE_TMP" "$MERGE_LOG"
+    rm -f "$MERGED_TMP" "$BASE_TMP" "$MERGE_LOG" "$WT_SNAPSHOT"
 done
 
 # Skills sync

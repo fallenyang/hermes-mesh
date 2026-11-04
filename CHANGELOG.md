@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.1.1 — 2026-11-03
+
+Field fix, found while rolling 1.1.0 across a four-machine fleet.
+
+### Fixed — a machine with less memory can no longer delete the fleet's
+When a machine is already **up to date**, the merge base equals the remote side.
+Any entry the hub holds but that machine's live memory lacks then reads as a
+*deliberate local deletion* and is pushed to every other machine. A laptop
+joining the mesh with a one-entry `USER.md` truncated the 6-entry profile on
+three workers; the hub only survived because the 1.1.0 guard happened to fire
+on the machine that was still whole.
+
+The merge guard now runs against **both** sides: the merged result must contain
+every entry that was in live memory *and* every entry the hub held before the
+merge. Drops are restored and reported as
+`memory-drop-prevented:FILE/local(n)` and `memory-drop-prevented:FILE/remote(n)`.
+
+Consequence, stated plainly: a sync cycle will no longer propagate a *deletion*.
+Removing a fact fleet-wide is an explicit operation (`--force-push` from the
+machine whose copy is authoritative, or edit the hub). Deleting knowledge by
+accident is worse than deleting it deliberately.
+
+### Tests
+- 61 → 64 assertions, including a regression test for that truncation case: an
+  up-to-date machine holding 1 of the hub's 3 entries must end with all 3.
+  It fails against 1.1.0's single-sided guard (3 failures) and passes here.
+
 ## 1.1.0 — 2026-11-03
 
 Hardening release. Every fix below was found in a live three-machine mesh and

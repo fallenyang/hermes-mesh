@@ -132,7 +132,7 @@ Warnings worth acting on immediately:
 
 | Warning | Meaning |
 |---|---|
-| `memory-drop-prevented:FILE(n)` | The merge tried to delete `n` entries that existed locally. They were restored — but a machine's merge base is stale, so check why. |
+| `memory-drop-prevented:FILE/local(n)` / `FILE/remote(n)` | The merge tried to delete `n` entries that existed on that machine / on the hub. They were restored. |
 | `memory-guard-failed:FILE` | The guard could not run; live memory was left untouched rather than overwritten. |
 | `skill-drift:N` | Live and worktree skill trees differ after import. |
 | `fetch-failed` / `push-failed` | SSH/auth or reachability — the coordinator is unreachable. |
