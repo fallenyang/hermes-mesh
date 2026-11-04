@@ -218,6 +218,35 @@ def filter_for_machine(text: str, machine: str) -> str:
     return '\n§\n'.join(kept) + '\n'
 
 
+def ensure_contains(merged_path: str, require_path: str, out_path: str) -> int:
+    """Re-add entries that exist in `require` but vanished from `merged`.
+
+    Safety net for the destructive case: a stale or rewritten merge base makes
+    the three-way merge read a local-only entry as "deleted remotely" and drop
+    it. A missing merge-base (no common ancestor after a history rewrite) has
+    the same effect. Nothing that exists in the live memory may disappear from
+    a sync run, so any such entry is appended back verbatim.
+
+    Returns the number of entries that had to be restored.
+    """
+    merged_text = Path(merged_path).read_text()
+    merged = parse_entries(merged_text)
+    required = parse_entries(Path(require_path).read_text())
+
+    have = {(tag, norm(body)) for tag, body, _ in merged}
+    restored = [full for tag, body, full in required
+                if (tag, norm(body)) not in have]
+
+    if restored:
+        out = merged_text.rstrip('\n')
+        for entry in restored:
+            out += '\n§\n' + entry
+        Path(out_path).write_text(out + '\n')
+    else:
+        Path(out_path).write_text(merged_text)
+    return len(restored)
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
@@ -229,9 +258,23 @@ def main():
     ap.add_argument('--filter', action='store_true',
                     help='Filter a file: keep only entries for this machine + global')
     ap.add_argument('--infile', help='File to filter (with --filter)')
+    ap.add_argument('--ensure-contains', action='store_true',
+                    help='Re-add entries from --require missing in --infile '
+                         '(no live entry may be dropped by a sync)')
+    ap.add_argument('--require',
+                    help='Authoritative file whose entries must survive '
+                         '(with --ensure-contains)')
     args = ap.parse_args()
 
-    if args.filter:
+    if args.ensure_contains:
+        if not (args.infile and args.require):
+            ap.error('--ensure-contains requires --infile and --require')
+        restored = ensure_contains(args.infile, args.require, args.out)
+        if restored:
+            print(f"  ⚠ restored {restored} entry(ies) the merge tried to drop",
+                  file=sys.stderr)
+        print(f"DROPPED={restored}")
+    elif args.filter:
         if not args.infile:
             ap.error('--filter requires --infile')
         text = Path(args.infile).read_text()

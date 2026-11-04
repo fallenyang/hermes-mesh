@@ -43,6 +43,10 @@ WT="$(cd "$(dirname "$0")" && pwd)"
 CONFIG="${HERMES_MESH_CONFIG:-$WT/config.toml}"
 LOG="${HERMES_MESH_LOG:-$HOME/.hermes/logs/knowledge-sync.log}"
 LOCKFILE="/tmp/hermes-mesh-sync.lock"
+# Declared up front: the dry-run path cleans up this temp file before the
+# export branch assigns it, and `set -u` turns that into "unbound variable".
+EXCLUDE_FILE=""
+
 mkdir -p "$(dirname "$LOG")"
 
 log()  { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
@@ -215,8 +219,16 @@ if ! git fetch origin 2>"$FETCH_ERR"; then
 fi
 rm -f "$FETCH_ERR"
 
+# True common ancestor of local and remote, captured BEFORE the pull. Once a
+# rebase/reset rewrites local history, HEAD is no longer a valid merge base:
+# entries that exist locally but not remotely then look like remote deletions
+# and the three-way merge drops them. This is what silently ate a
+# machine-specific memory entry on a worker whose rebase had failed.
+MEMORY_MERGE_BASE=$(git merge-base HEAD "origin/$BRANCH" 2>/dev/null || true)
+
 REMOTE_HASH=$(git rev-parse "origin/$BRANCH" 2>/dev/null || echo "")
 LOCAL_HASH=$(git rev-parse HEAD 2>/dev/null || echo "")
+
 
 if [ -n "$REMOTE_HASH" ] && [ "$REMOTE_HASH" != "$LOCAL_HASH" ]; then
     OLD_HEAD="$LOCAL_HASH"
@@ -240,14 +252,15 @@ if [ -n "$REMOTE_HASH" ] && [ "$REMOTE_HASH" != "$LOCAL_HASH" ]; then
             log "rebase failed — aborting and resetting to remote"
             log "  ⤷ $(head -2 "$REBASE_ERR" | tr '\n' ' ')"
             cat "$REBASE_ERR" >> "$LOG"
-            # Reset to known state first, then clean up rebase state
-            git reset --hard "origin/$BRANCH"
-            git clean -fd
-            # Belt-and-suspenders: if rebase --abort fails, manually nuke rebase state.
-            # Working tree is already clean from reset+clean above — just remove
-            # .git/rebase-merge so git doesn't think it's mid-rebase.
+            # Abort FIRST: `git rebase --abort` restores the branch to its
+            # pre-rebase tip, so running it after `reset --hard` silently
+            # undoes the reset and leaves HEAD on the diverged commit. The
+            # next cycle then replays the same failing rebase forever.
             git rebase --abort 2>/dev/null || \
                 rm -rf "$(git rev-parse --git-dir)/rebase-merge" 2>/dev/null
+            # Only now return to a known-good remote state.
+            git reset --hard "origin/$BRANCH"
+            git clean -fd
             warn "rebase-aborted"
         fi
         rm -f "$REBASE_ERR"
@@ -256,8 +269,9 @@ else
     log "up to date"
 fi
 
-# Memory merge
-MERGE_BASE="${OLD_HEAD:-$(git rev-parse HEAD)}"
+# Memory merge. Prefer the true common ancestor; OLD_HEAD is only a fallback
+# for the rare case where no merge base exists at all.
+MERGE_BASE="${MEMORY_MERGE_BASE:-${OLD_HEAD:-$(git rev-parse HEAD)}}"
 for PAIR in "MEMORY.md:memory/agent-memory.md" "USER.md:memory/user-profile.md"; do
     LIVE_NAME="${PAIR%%:*}"
     WT_REL="${PAIR##*:}"
@@ -277,12 +291,32 @@ for PAIR in "MEMORY.md:memory/agent-memory.md" "USER.md:memory/user-profile.md";
             N=$(grep -oP 'FALLBACKS=\K\d+' "$MERGE_LOG" || echo "?")
             warn "llm-fallback:$LIVE_NAME($N)"
         fi
-        diff -q "$MERGED_TMP" "$WT_FILE" >/dev/null 2>&1 || cp "$MERGED_TMP" "$WT_FILE"
-        FILTERED_TMP=$(mktemp)
-        if python3 "$WT/memory-merge.py" --filter --machine "$MACHINE" --infile "$MERGED_TMP" --out "$FILTERED_TMP"; then
-            diff -q "$FILTERED_TMP" "$LIVE" >/dev/null 2>&1 || cp "$FILTERED_TMP" "$LIVE"
+        # Guard: nothing present in live memory may vanish because of this run.
+        # A stale merge base (or a history rewrite that leaves none) makes the
+        # merge read a local-only entry as a remote deletion; this restores it.
+        GUARDED_TMP=$(mktemp)
+        GUARD_LOG=$(mktemp)
+        if python3 "$WT/memory-merge.py" --machine "$MACHINE" --ensure-contains \
+                --infile "$MERGED_TMP" --require "$LIVE" --out "$GUARDED_TMP" >"$GUARD_LOG" 2>&1; then
+            cat "$GUARD_LOG" >> "$LOG"
+            DROPPED_N=$(grep -oP 'DROPPED=\K\d+' "$GUARD_LOG" 2>/dev/null | head -1 || true)
+            if [ "${DROPPED_N:-0}" -gt 0 ]; then
+                warn "memory-drop-prevented:$LIVE_NAME($DROPPED_N)"
+            fi
+            diff -q "$GUARDED_TMP" "$WT_FILE" >/dev/null 2>&1 || cp "$GUARDED_TMP" "$WT_FILE"
+            FILTERED_TMP=$(mktemp)
+            if python3 "$WT/memory-merge.py" --filter --machine "$MACHINE" --infile "$GUARDED_TMP" --out "$FILTERED_TMP"; then
+                diff -q "$FILTERED_TMP" "$LIVE" >/dev/null 2>&1 || cp "$FILTERED_TMP" "$LIVE"
+            fi
+            rm -f "$FILTERED_TMP"
+        else
+            # Guard unavailable — refuse to rewrite live memory from a merge we
+            # could not verify. The worktree still gets the merged version.
+            warn "memory-guard-failed:$LIVE_NAME"
+            cat "$GUARD_LOG" >> "$LOG"
+            diff -q "$MERGED_TMP" "$WT_FILE" >/dev/null 2>&1 || cp "$MERGED_TMP" "$WT_FILE"
         fi
-        rm -f "$FILTERED_TMP"
+        rm -f "$GUARDED_TMP" "$GUARD_LOG"
     else
         warn "merge-failed:$LIVE_NAME"
     fi
@@ -375,6 +409,15 @@ if [ -d "$SKILLS_SRC" ] && [ -d "$SKILLS_DST" ]; then
     rm -f "$RSYNC_IMPORT_ERR"
 
     log "skills synced"
+    # Verification: the whole point of the import is that live and worktree
+    # converge. If they didn't, say so — a silently diverging skill tree that
+    # still reports HEALTH: OK is worse than a loud warning.
+    SKILL_DRIFT=$(diff -rq "$SKILLS_DST" "$SKILLS_SRC" 2>/dev/null | wc -l || echo 0)
+    if [ "${SKILL_DRIFT:-0}" -gt 0 ]; then
+        warn "skill-drift:$SKILL_DRIFT"
+        log "  ⤷ live and worktree skills differ after import ($SKILL_DRIFT path(s))"
+        diff -rq "$SKILLS_DST" "$SKILLS_SRC" 2>/dev/null | head -10 | while IFS= read -r _l; do log "    $_l"; done
+    fi
     rm -f "$EXCLUDE_FILE" "$REMOTE_DELETED" "$REMOTE_CHANGED" "$LOCAL_CHANGED"
 else
     log "skills: no dirs — skipping"
