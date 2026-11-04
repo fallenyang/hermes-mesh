@@ -1,5 +1,63 @@
 # Changelog
 
+## 1.1.0 — 2026-11-03
+
+Hardening release. Every fix below was found in a live three-machine mesh and
+each one has a regression test that fails against 1.0.2.
+
+### Fixed — memory safety
+- **Local memory could be silently deleted.** The three-way merge used the
+  pre-pull `HEAD` as its merge base. As soon as a rebase had rewritten local
+  history, entries that existed only on that machine looked like *remote
+  deletions* and were dropped without a warning. The merge base is now the true
+  `git merge-base` of local and remote, captured before any pull.
+- **New `--ensure-contains` guard.** After merging, any entry present in live
+  memory but missing from the merged result is restored verbatim and reported
+  as `memory-drop-prevented`. A sync can no longer remove a fact the machine
+  already knew.
+- If the guard itself cannot run, live memory is left untouched
+  (`memory-guard-failed`) instead of being overwritten from an unverified merge.
+
+### Fixed — sync loops
+- **Failed rebases looped forever.** `git rebase --abort` ran *after*
+  `git reset --hard origin/BRANCH`; the abort restores the branch to its
+  pre-rebase tip, which silently undid the reset. HEAD stayed on the diverged
+  commit and every subsequent cycle replayed the same failing rebase. Abort now
+  runs first, then the reset.
+- **`sync.sh --dry-run` crashed.** The cleanup path referenced `$EXCLUDE_FILE`
+  before it was assigned and `set -u` turned that into `unbound variable`, so
+  the documented safe preview exited 1 whenever both skills directories
+  existed.
+
+### Fixed — scheduling
+- **Silent no-op scheduler on systems without cron.** `setup.sh` installed a
+  crontab as long as the `crontab` binary existed, without checking that a cron
+  daemon was running. On Arch/CachyOS the job never fired and the log simply
+  stopped. A crontab binary is no longer treated as proof: the installer
+  detects a running daemon (`cron` / `crond` / `cronie`, or the process) and
+  falls back to a **systemd user timer** (`OnUnitActiveSec`, `Persistent=true`),
+  warning when lingering is disabled. Override with
+  `HERMES_MESH_SCHEDULER=cron|systemd|auto`.
+- `uninstall.sh` removes the systemd timer units as well.
+
+### Fixed — installation
+- **`bash setup.sh < answers` installed a different version than the one it was
+  running.** Any non-TTY stdin was treated as `curl | bash` and re-cloned the
+  scripts from GitHub, so automation and CI seeded worktrees from upstream
+  instead of the working tree. setup.sh now prefers the scripts beside itself
+  and only clones when there is no script file on disk. Pin explicitly with
+  `HERMES_MESH_SOURCE_DIR`.
+
+### Fixed — observability
+- Skill drift after import is now detected and reported (`skill-drift:N`) with
+  the offending paths, instead of logging `HEALTH: OK` over a diverging tree.
+
+### Tests
+- 48 → 61 assertions. New coverage for the dry-run crash, failed-rebase memory
+  preservation, the merge guard, and the systemd timer fallback.
+- The harness mocks `systemctl`/`loginctl` and pins `HERMES_MESH_SOURCE_DIR`, so
+  results no longer depend on whether the host happens to run cron.
+
 ## 1.0.2 — 2026-06-27
 
 ### Added

@@ -116,7 +116,7 @@ interval_minutes = 15
 - **Python 3.8+** (with `tomli` if < 3.11 — setup tells you exactly what to install)
 - **Git** — any modern version
 - **SSH** — workers need key access to coordinator
-- **cron** (Linux) or **launchd** (macOS, built-in)
+- **A scheduler** — a running **cron** daemon, or **systemd user timers**, on Linux; **launchd** on macOS (built-in). Setup detects which one will actually fire and installs accordingly; a `crontab` binary alone is not treated as proof that anything runs.
 
 ---
 
@@ -127,6 +127,15 @@ grep -E 'HEALTH|WARNING|SKILL CONFLICTS' ~/.hermes/logs/knowledge-sync.log
 ```
 
 Every sync cycle prints a `HEALTH: OK` line. Warnings tell you exactly what needs attention.
+
+Warnings worth acting on immediately:
+
+| Warning | Meaning |
+|---|---|
+| `memory-drop-prevented:FILE(n)` | The merge tried to delete `n` entries that existed locally. They were restored — but a machine's merge base is stale, so check why. |
+| `memory-guard-failed:FILE` | The guard could not run; live memory was left untouched rather than overwritten. |
+| `skill-drift:N` | Live and worktree skill trees differ after import. |
+| `fetch-failed` / `push-failed` | SSH/auth or reachability — the coordinator is unreachable. |
 
 ---
 

@@ -63,6 +63,23 @@ CRONMOCK
     touch "$MOCK_CRON_FILE"
     export PATH="$MOCK_BIN:$PATH"
 
+    # ── mock systemctl/loginctl (systemd-timer scheduler path) ──
+    cat > "$MOCK_BIN/systemctl" << 'SYSTEMMOCK'
+#!/usr/bin/env bash
+printf 'systemctl %s\n' "$*" >> "${MOCK_SYSTEMCTL_LOG:-/dev/null}"
+case " $* " in
+    *" is-active "*) exit 3 ;;   # pretend no cron daemon is running
+    *) exit 0 ;;
+esac
+SYSTEMMOCK
+    chmod +x "$MOCK_BIN/systemctl"
+    cat > "$MOCK_BIN/loginctl" << 'LOGINCTLMOCK'
+#!/usr/bin/env bash
+echo "Linger=yes"
+exit 0
+LOGINCTLMOCK
+    chmod +x "$MOCK_BIN/loginctl"
+
     # Copy scripts to a local "dev repo" for setup.sh to seed from
     DEV_REPO="$TEST_HOME/hermes-mesh-dev"
     mkdir -p "$DEV_REPO"
@@ -80,7 +97,9 @@ run_setup() {
     else
         answers=$(printf '%s\n' "$machine" "2" "$worktree" "user@host:${bare}" "$home/.hermes" "$interval" "$auto_tag" "y")
     fi
-    HOME="$home" bash "$DEV_REPO/setup.sh" <<< "$answers" 2>&1 || true
+    HOME="$home" HERMES_MESH_SCHEDULER="${SCHEDULER_FOR_TEST:-cron}" \
+        HERMES_MESH_SOURCE_DIR="$DEV_REPO" \
+        bash "$DEV_REPO/setup.sh" <<< "$answers" 2>&1 || true
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -380,6 +399,112 @@ test_sync_mutually_exclusive_flags() {
     assert_contains "$out" "mutually exclusive" "rejects both flags"
 }
 
+# ── regression: --dry-run must not crash ───────────────────────
+# The dry-run cleanup referenced $EXCLUDE_FILE before it was assigned, and
+# `set -u` turned that into "unbound variable" — so the documented safe
+# preview died with exit 1 whenever both skills dirs existed.
+test_sync_dry_run_no_crash() {
+    echo -e "\n${BOLD}── sync: --dry-run never crashes (regression)${NC}"
+    setup_test_env "sync-dry"
+    local home="$TEST_HOME/sync-dry"
+    local wt="$home/hermes-mesh"
+    run_setup "$home" "coordinator" "box" "$wt" "60" "n"
+
+    # Both skills dirs must exist to reach the export/cleanup branch.
+    mkdir -p "$wt/skills/demo" "$home/.hermes/skills/demo"
+    echo "# demo" > "$wt/skills/demo/SKILL.md"
+    echo "# demo" > "$home/.hermes/skills/demo/SKILL.md"
+    ( cd "$wt" && git add -A && git commit -qm "add skills" && git push -q origin main ) >/dev/null 2>&1 || true
+
+    local out rc=0
+    out=$(cd "$wt" && bash sync.sh --dry-run 2>&1) || rc=$?
+
+    assert_eq "$rc" "0" "--dry-run exits 0"
+    if echo "$out" | grep -q 'unbound variable'; then
+        fail "--dry-run raised unbound variable"
+    else
+        pass "--dry-run raised no unbound variable"
+    fi
+    assert_contains "$out" "DRY-RUN" "--dry-run reports a preview"
+}
+
+# ── regression: failed rebase must not destroy local memory ────
+# Two bugs compounded: `git rebase --abort` ran after `reset --hard` and
+# restored the diverged commit (infinite loop), and the memory merge used the
+# pre-pull HEAD as its base, so a local-only entry looked like a remote
+# deletion and was silently dropped.
+test_sync_failed_rebase_preserves_memory() {
+    echo -e "\n${BOLD}── sync: failed rebase keeps local memory (regression)${NC}"
+    setup_test_env "sync-rebase"
+    local home="$TEST_HOME/sync-rebase"
+    local bare="$home/git/hermes-mesh.git"
+    local wt="$home/hermes-mesh"
+    run_setup "$home" "coordinator" "box" "$wt" "60" "n"
+
+    # Live memory carries a fact only this machine knows.
+    printf 'shared fact\n§\nMACHINE-LOCAL-FACT\n' > "$home/.hermes/memories/MEMORY.md"
+
+    # Diverged local commit touching the same file (guarantees a conflict).
+    printf 'shared fact\n§\nMACHINE-LOCAL-FACT\n' > "$wt/memory/agent-memory.md"
+    ( cd "$wt" && git add -A && git commit -qm "local diverged commit" ) >/dev/null 2>&1
+
+    # Remote advances on the same file from a separate clone.
+    local other="$TEST_HOME/sync-rebase-other"
+    git clone -q "$bare" "$other" 2>/dev/null
+    ( cd "$other" \
+        && printf 'shared fact\n§\nREMOTE-FACT\n' > memory/agent-memory.md \
+        && git add -A \
+        && git -c user.email=r@r -c user.name=r commit -qm "remote commit" \
+        && git push -q origin main ) >/dev/null 2>&1
+
+    ( cd "$wt" && bash sync.sh ) >/dev/null 2>&1 || true
+
+    assert_eq "$(cd "$wt" && git rev-parse HEAD)" \
+              "$(cd "$wt" && git rev-parse origin/main)" \
+              "failed rebase leaves HEAD at the remote tip"
+    assert_contains "$(cat "$home/.hermes/memories/MEMORY.md")" "MACHINE-LOCAL-FACT" \
+        "local-only memory entry survived the failed rebase"
+    assert_contains "$(cat "$home/.hermes/memories/MEMORY.md")" "REMOTE-FACT" \
+        "remote entry was merged in"
+}
+
+# ── regression: merge guard restores entries ───────────────────
+test_merge_ensure_contains() {
+    echo -e "\n${BOLD}── merge: --ensure-contains restores dropped entries${NC}"
+    local merged=$(mktemp) live=$(mktemp) out=$(mktemp)
+    printf 'keep me\n§\nremote only\n' > "$merged"
+    printf 'keep me\n§\nlocal only\n§\nremote only\n' > "$live"
+
+    python3 "$SCRIPT_DIR/memory-merge.py" --machine a --ensure-contains \
+        --infile "$merged" --require "$live" --out "$out" >/dev/null 2>&1
+
+    assert_contains "$(cat "$out")" "local only"  "dropped entry restored"
+    assert_contains "$(cat "$out")" "remote only" "existing entry kept"
+    rm -f "$merged" "$live" "$out"
+}
+
+# ── setup: systemd user timer when cron is unusable ────────────
+test_setup_systemd_timer_fallback() {
+    echo -e "\n${BOLD}── setup: systemd user timer when cron is unavailable${NC}"
+    setup_test_env "setup-timer"
+    local home="$TEST_HOME/setup-timer"
+    local wt="$home/hermes-mesh"
+    SCHEDULER_FOR_TEST=systemd run_setup "$home" "coordinator" "timerbox" "$wt" "10" "n"
+
+    local unit="$home/.config/systemd/user"
+    assert_file "$unit/hermes-mesh-sync.timer"   "timer unit written"
+    assert_file "$unit/hermes-mesh-sync.service" "service unit written"
+    assert_contains "$(cat "$unit/hermes-mesh-sync.timer" 2>/dev/null || echo '')" \
+        "OnUnitActiveSec=10min" "timer uses the configured interval"
+    assert_contains "$(cat "$unit/hermes-mesh-sync.service" 2>/dev/null || echo '')" \
+        "$wt/sync.sh" "service runs the worktree sync.sh"
+    if crontab -l 2>/dev/null | grep -q "hermes-mesh-sync"; then
+        fail "cron job installed as well as the timer"
+    else
+        pass "no duplicate cron job installed"
+    fi
+}
+
 # ═══════════════════════════════════════════════════════════════
 # UNINSTALL TESTS
 # ═══════════════════════════════════════════════════════════════
@@ -485,6 +610,7 @@ run_section setup test_setup_coordinator
 run_section setup test_setup_worker
 run_section setup test_setup_rejects_bad_interval
 run_section setup test_setup_rejects_zero_interval
+run_section setup test_setup_systemd_timer_fallback
 
 run_section merge test_merge_remote_addition
 run_section merge test_merge_local_addition
@@ -494,11 +620,14 @@ run_section merge test_merge_both_edited_different
 run_section merge test_merge_same_entry_both_edited
 run_section merge test_merge_single_entry_no_delimiter
 run_section merge test_merge_fixtures
+run_section merge test_merge_ensure_contains
 
 run_section sync test_sync_normal
 run_section sync test_sync_force_push
 run_section sync test_sync_force_pull
 run_section sync test_sync_mutually_exclusive_flags
+run_section sync test_sync_dry_run_no_crash
+run_section sync test_sync_failed_rebase_preserves_memory
 
 run_section uninstall test_uninstall_coordinator
 run_section uninstall test_uninstall_abort
