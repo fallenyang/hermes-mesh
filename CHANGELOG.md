@@ -55,8 +55,10 @@ each one has a regression test that fails against 1.0.2.
 ### Tests
 - 48 → 61 assertions. New coverage for the dry-run crash, failed-rebase memory
   preservation, the merge guard, and the systemd timer fallback.
-- The harness mocks `systemctl`/`loginctl` and pins `HERMES_MESH_SOURCE_DIR`, so
-  results no longer depend on whether the host happens to run cron.
+- The harness mocks `systemctl`/`loginctl`, pins `HERMES_MESH_SOURCE_DIR`, and
+  isolates `HOME` and the sync lock (`HERMES_MESH_LOCK`) per test — results no
+  longer depend on whether the host runs cron, and a test run can no longer
+  write to the operator's real sync log or block their scheduled cycle.
 
 ## 1.0.2 — 2026-06-27
 

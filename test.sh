@@ -61,6 +61,7 @@ CRONMOCK
     chmod +x "$MOCK_BIN/crontab"
     export MOCK_CRON_FILE="$TEST_HOME/.test-crontab"
     touch "$MOCK_CRON_FILE"
+    export HERMES_MESH_LOCK="$TEST_HOME/.test-sync.lock"
     export PATH="$MOCK_BIN:$PATH"
 
     # ── mock systemctl/loginctl (systemd-timer scheduler path) ──
@@ -345,7 +346,7 @@ test_sync_normal() {
 
     # Run sync manually
     local out
-    out=$(cd "$TEST_HOME/sync-normal/hermes-mesh" && bash sync.sh 2>&1) || true
+    out=$(cd "$TEST_HOME/sync-normal/hermes-mesh" && HOME="$TEST_HOME/sync-normal" bash sync.sh 2>&1) || true
     assert_contains "$out" "HEALTH" "sync produces health line"
 }
 
@@ -360,7 +361,7 @@ test_sync_force_push() {
     echo "force-push test entry" >> "$TEST_HOME/sync-fpush/.hermes/memories/MEMORY.md"
 
     local out
-    out=$(cd "$TEST_HOME/sync-fpush/hermes-mesh" && bash sync.sh --force-push 2>&1) || true
+    out=$(cd "$TEST_HOME/sync-fpush/hermes-mesh" && HOME="$TEST_HOME/sync-fpush" bash sync.sh --force-push 2>&1) || true
 
     assert_contains "$out" "FORCE-PUSH" "force-push mode activated"
     assert_contains "$out" "HEALTH" "force-push produces health line"
@@ -382,7 +383,7 @@ test_sync_force_pull() {
 
     # Force pull
     local out
-    out=$(cd "$TEST_HOME/sync-fpull/hermes-mesh" && bash sync.sh --force-pull 2>&1) || true
+    out=$(cd "$TEST_HOME/sync-fpull/hermes-mesh" && HOME="$TEST_HOME/sync-fpull" bash sync.sh --force-pull 2>&1) || true
 
     assert_contains "$out" "FORCE-PULL" "force-pull mode activated"
     assert_contains "$(cat "$TEST_HOME/sync-fpull/.hermes/memories/MEMORY.md")" "remote-only entry" "force-pull overwrote live memory"
@@ -395,7 +396,7 @@ test_sync_mutually_exclusive_flags() {
     run_setup "$TEST_HOME/sync-both" "coordinator" "box" "$TEST_HOME/sync-both/hermes-mesh" "60" "n"
 
     local out
-    out=$(cd "$TEST_HOME/sync-both/hermes-mesh" && bash sync.sh --force-push --force-pull 2>&1) || true
+    out=$(cd "$TEST_HOME/sync-both/hermes-mesh" && HOME="$TEST_HOME/sync-both" bash sync.sh --force-push --force-pull 2>&1) || true
     assert_contains "$out" "mutually exclusive" "rejects both flags"
 }
 
@@ -417,7 +418,7 @@ test_sync_dry_run_no_crash() {
     ( cd "$wt" && git add -A && git commit -qm "add skills" && git push -q origin main ) >/dev/null 2>&1 || true
 
     local out rc=0
-    out=$(cd "$wt" && bash sync.sh --dry-run 2>&1) || rc=$?
+    out=$(cd "$wt" && HOME="$home" bash sync.sh --dry-run 2>&1) || rc=$?
 
     assert_eq "$rc" "0" "--dry-run exits 0"
     if echo "$out" | grep -q 'unbound variable'; then
@@ -457,7 +458,7 @@ test_sync_failed_rebase_preserves_memory() {
         && git -c user.email=r@r -c user.name=r commit -qm "remote commit" \
         && git push -q origin main ) >/dev/null 2>&1
 
-    ( cd "$wt" && bash sync.sh ) >/dev/null 2>&1 || true
+    ( cd "$wt" && HOME="$home" bash sync.sh ) >/dev/null 2>&1 || true
 
     assert_eq "$(cd "$wt" && git rev-parse HEAD)" \
               "$(cd "$wt" && git rev-parse origin/main)" \

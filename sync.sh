@@ -42,7 +42,7 @@ fi
 WT="$(cd "$(dirname "$0")" && pwd)"
 CONFIG="${HERMES_MESH_CONFIG:-$WT/config.toml}"
 LOG="${HERMES_MESH_LOG:-$HOME/.hermes/logs/knowledge-sync.log}"
-LOCKFILE="/tmp/hermes-mesh-sync.lock"
+LOCKFILE="${HERMES_MESH_LOCK:-/tmp/hermes-mesh-sync.lock}"
 # Declared up front: the dry-run path cleans up this temp file before the
 # export branch assigns it, and `set -u` turns that into "unbound variable".
 EXCLUDE_FILE=""
