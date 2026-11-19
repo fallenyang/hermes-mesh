@@ -1,86 +1,99 @@
-# Mesh v2 — one copy, git only
+# mesh-v2 — design notes and migration detail
 
-The 1.x design keeps **two copies of every file** — the live tree Hermes reads
-(`$HERMES_HOME/skills`, `$HERMES_HOME/memories`) and a git worktree — and mirrors
-them with `rsync --delete`, local wins.
+Install steps live in the [root README](../README.md). This file holds the parts
+worth keeping: why the 1.x engine failed, what the migration actually does, how to
+verify it, and how to get out.
 
-That architecture loses data. Any worker whose live tree is older than the hub
-pushes the older tree over it, and the conflict detector cannot see it: it only
-examines what moved *in the current cycle*, so a machine that fast-forwarded in an
-earlier run, or pulled a large batch at once, sees an empty deletion window and
-propagates the deletions as if they were edits. In the field this cost 584 lines
-of skills on one machine and 722 on another within one afternoon, from two
-different workers. The memory merge has a matching failure: entries are keyed by
-content, so a patch is read as delete+add, and the "never drop an entry" guard
-re-adds the superseded text — a 13-entry memory re-inflated to 38 entries / 8.2 kB
-(3.7x the 2,200-char limit) within one cycle.
+## Why the 1.x engine failed
 
-v2 removes the second copy instead of trying to reconcile it.
+Both defects come from the same root cause: **every machine kept two copies of the
+same state** (the live tree Hermes reads, and a git worktree) and mirrored them
+with `rsync --delete`, local wins.
 
-## Layout
+**Skills.** `sync.sh` exported live → worktree (no `--delete`), then imported
+worktree → live (`--delete`), then committed whatever the export produced. A
+machine whose live tree was older than the hub therefore wrote the older tree into
+the worktree and committed it. Nothing flagged it as a conflict, because the
+detector built its "what changed remotely" list from `OLD_HEAD..POST_PULL` — only
+the current cycle. A worker that had already fast-forwarded, or pulled a large
+batch at once, saw an empty deletion window, and the deletions propagated as edits.
+Measured cost in one afternoon: 584 lines, then 722 lines, from two different
+workers.
 
-Each repo's **worktree is the live directory**:
+**Memory.** `memory-merge.py` keyed entries by `(machine tag, normalized body)`.
+A patch to an entry is therefore a delete of one key plus an add of another, and
+the `--ensure-contains` guard (added to stop the merge dropping entries) re-added
+the superseded text verbatim. Thirteen consolidated entries re-inflated to
+thirty-eight (8.2 kB) against a 2,200-character limit within one cycle, and the
+run still reported `HEALTH: OK`.
 
-```
-$HERMES_HOME/skills      git worktree -> hermes-skills.git
-$HERMES_HOME/memories    git worktree -> hermes-memory.git
-$HERMES_HOME/mesh-state  git worktree -> hermes-state.git   (heartbeats)
-$HERMES_HOME/git/        separate git dirs (keeps .git out of the skills tree)
-$HERMES_HOME/bin/mesh-sync.sh
-$HERMES_HOME/mesh.conf   MACHINE="<name>"
-```
+Adding more guards to a mirror cannot fix a mirror. 2.x deletes it.
 
-`git init --separate-git-dir` converts an existing live directory in place, so no
-copying of content is required and nothing has to be reconciled. Hermes and the
-curator tolerate the `.git` *file* this leaves in the skills tree — verified by
-enumerating every skill after conversion.
+## What the migration does
 
-## What the sync does
-
-Per repo: commit local changes, `pull --rebase --autostash`, push. Three attempts
-each with backoff.
-
-- No `rsync`, no `--force-pull`, `--force-push`, `--squash`, `--resolve-skills`.
-- No LLM in the loop; `memory-merge.py` is not used.
-- A rebase conflict aborts, logs `CONFLICT`, and leaves that repo unpushed. It
-  never picks a side.
-- Deletions are commits, so they propagate like any other change.
-- Per-machine bookkeeping (`skills/.usage.json`, `.curator_state`,
-  `.curator_ledger.jsonl`, `.bundled_manifest`, `.hub/`, `.locks/`, `*.lock`) is
-  gitignored. It used to be tracked and committed every cycle on every machine.
-
-## Memory model
-
-One shared `MEMORY.md` / `USER.md`, identical bytes on every worker, no
-`⟨machine:⟩` filtering. Hermes caps them at 2,200 / 1,375 chars, so they hold the
-top facts only; deep detail belongs in skills, which sync the same way and have no
-cap. Secrets never belong in either file.
-
-## Heartbeats
-
-`hermes-state.git` holds one branch per machine (`state/<hostname>`) force-pushed
-at most hourly, so heartbeats cannot race or conflict. A machine whose branch is
-more than ~2 hours old is not syncing.
-
-## Install on a worker
+Per machine, in place, with no copying of content:
 
 ```bash
-# 1. back up, then convert the live dirs in place
-tar czf ~/pre-v2-$(date +%F).tar.gz -C ~/.hermes skills memories
-git init -q --separate-git-dir ~/.hermes/git/skills.git -b main -- ~/.hermes/skills
-git init -q --separate-git-dir ~/.hermes/git/memory.git -b main -- ~/.hermes/memories
-# 2. add .gitignore (see the list above), commit, add origin, push
-# 3. install mesh-sync.sh + mesh.conf, one cron line
+tar czf ~/pre-mesh-v2-$(date +%F).tar.gz -C ~/.hermes skills memories
+git init --separate-git-dir ~/.hermes/git/skills.git -b main -- ~/.hermes/skills
+git init --separate-git-dir ~/.hermes/git/memory.git -b main -- ~/.hermes/memories
 ```
 
-A bare repo must have `HEAD -> refs/heads/main`, or `git clone` produces an empty
-worktree with only `warning: remote HEAD refers to nonexistent ref`.
+`--separate-git-dir` leaves a small `.git` **file** in the live directory instead of
+a `.git` directory. Hermes and the skill curator tolerate that — verified by
+enumerating every skill (`skills_list`) after conversion, and by a full agent turn.
+
+`.gitignore` in the skills repo, so per-machine counters stop being commits:
 
 ```
-*/15 * * * * ~/.hermes/bin/mesh-sync.sh >/dev/null 2>&1
+.usage.json
+.curator_state
+.curator_ledger.jsonl
+.bundled_manifest
+.hub/
+.locks/
+*.lock
 ```
+
+And in the memory repo: `*.lock`.
+
+## Verifying a migration
+
+```bash
+git -C ~/.hermes/skills   rev-parse --short HEAD   # same sha on every worker
+git -C ~/.hermes/memories rev-parse --short HEAD
+md5sum ~/.hermes/memories/MEMORY.md                # identical on every worker
+~/.hermes/bin/mesh-sync.sh && tail -3 ~/.hermes/logs/mesh-sync.log
+```
+
+Then a round trip, which is the only test that proves both directions:
+
+```bash
+echo probe > ~/.hermes/memories/ROUNDTRIP.md
+~/.hermes/bin/mesh-sync.sh                      # on machine A
+ssh B '~/.hermes/bin/mesh-sync.sh'; ssh B 'md5sum ~/.hermes/memories/ROUNDTRIP.md'
+ssh B 'rm ~/.hermes/memories/ROUNDTRIP.md; ~/.hermes/bin/mesh-sync.sh'
+~/.hermes/bin/mesh-sync.sh                      # deletion must propagate to A
+```
+
+## Operational notes
+
+- **Bare repos need `HEAD -> refs/heads/main`.** Otherwise `git clone` checks out
+  nothing and the only signal is `warning: remote HEAD refers to nonexistent ref`;
+  the live tree ends up empty and the failure looks like a broken agent.
+- **Do not share one heartbeat branch across machines.** A single `main` in the
+  state repo makes every worker race; the losers end up detached or wedged in
+  `CHERRY_PICK_HEAD`. One branch per machine, force-pushed, cannot conflict.
+- **`~/.hermes/state` is Hermes's own runtime directory** (gateway heartbeats).
+  Mesh state belongs in `~/.hermes/mesh-state`.
+- **Restart the gateway after editing `MEMORY.md` by hand.** A running gateway
+  holds memory in memory and will re-materialise its copy over the file on the next
+  memory write; the file looks like it "re-inflated by itself".
+- **Never carry secrets in the synced files.** A memory repo's history is permanent
+  and replicated to every worker; scrub the history, do not just delete the line.
 
 ## Rollback
 
-The tarball from step 1 restores the old layout, and the 1.x hub keeps the full
-history. Nothing in this design is destructive.
+The tarball from the migration restores the previous layout, and the 1.x hub keeps
+the full history. Nothing in 2.x is destructive, so rollback is unlinking the cron
+line and unpacking a tarball.

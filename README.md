@@ -2,51 +2,66 @@
 
 > *Your Hermes agents, one shared brain.*
 
-[![CI](https://github.com/B1Z0N/hermes-mesh/actions/workflows/ci.yml/badge.svg)](https://github.com/B1Z0N/hermes-mesh/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-1.0.1-blue)](https://github.com/B1Z0N/hermes-mesh/releases/tag/v1.0.1)
+![Version](https://img.shields.io/badge/version-2.0.0-blue)
 
-You have Hermes running on your VPS. On your MacBook. Maybe on a work PC or a scraper box. They're all smart — but they each have *different* memories. The VPS knows your server specs. The Mac knows your local paths. And neither remembers what you told the other.
+Hermes Mesh keeps the skills and the durable memory of every [Hermes
+Agent](https://github.com/NousResearch/hermes-agent) you run in sync — the laptop,
+the desktop, the VPS, the scraper box — so the agent you are talking to knows what
+the others learned.
 
-**Hermes Mesh fixes that.** It quietly keeps your agents' skills and durable memory in sync across every machine you run. So Hermes remembers the same things about you, your projects, and your preferences — no matter which machine you're talking to.
-
-It runs in the background every 15 minutes. Three-way merges sort out conflicts so machines don't overwrite each other. And machine-specific facts (hardware, IPs, local paths) stay local — they don't leak to your other machines.
-
----
-
-## 🚀 Quickstart
-
-One command per machine. Copy-paste, answer a few questions, done.
-
-```bash
-curl -sSL https://raw.githubusercontent.com/B1Z0N/hermes-mesh/main/setup.sh | bash
-```
-
-Setup walks you through a few friendly questions and handles everything else. It detects whether you're on macOS or Linux, installs the right scheduler, and even teaches Hermes to auto-tag facts so your Mac's hardware specs don't end up on your VPS.
+> **This fork runs 2.0.0**, a rewrite of the sync engine in
+> [B1Z0N/hermes-mesh](https://github.com/B1Z0N/hermes-mesh) 1.x. The 1.x scripts
+> (`sync.sh`, `memory-merge.py`, `setup.sh`, `test.sh`) are still in the tree and
+> still work, but they are not the supported path and nothing in the 2.x loop calls
+> them. See [Differences from 1.x](#-differences-from-1x).
 
 ---
 
-## 🧠 The idea
+## ⚠️ Why 2.0 exists
 
-Think of it like a shared notebook that every Hermes agent can read and write to — but each agent only sees the pages relevant to its own machine.
+1.x keeps **two copies of every file** — the live tree Hermes reads, and a git
+worktree — and mirrors them with `rsync --delete`, local wins.
+
+That architecture loses data. A machine whose live tree is older than the hub
+pushes the older tree over it, and the conflict detector cannot see it: it only
+examines what moved *in the current cycle*, so a worker that fast-forwarded in an
+earlier run, or pulled a large batch at once, sees an empty deletion window and
+propagates deletions as if they were edits. In one afternoon this removed 584
+lines of skills from one hub and 722 from it again, from two different workers.
+
+The memory merge has the same shape. Entries are keyed by content, so a *patch* to
+an entry reads as delete + add, and the "never drop an entry" guard re-adds the
+superseded text. A 13-entry memory re-inflated to 38 entries / 8.2 kB against a
+2,200-character limit inside a single cycle, and the guard reported it as a
+healthy sync.
+
+2.0 removes the second copy instead of trying to reconcile it.
+
+---
+
+## 🧠 How it works
+
+Each repo's **worktree *is* the live directory**. There is nothing to mirror:
 
 ```
-        ┌─────────────────────────────┐
-        │      Shared Knowledge       │
-        │  (Git repo on your VPS)     │
-        │                             │
-        │  "User prefers dark mode"   │  ← everyone sees this
-        │  "Project X is at ~/dev/x"  │  ← everyone sees this
-        │  ⟨vps⟩ 4GB RAM, 2 vCPUs     │  ← only VPS sees this
-        │  ⟨mac⟩ 16GB RAM, M2 Pro     │  ← only Mac sees this
-        └──────┬───────────┬──────────┘
-               │           │
-          ┌────▼───┐  ┌────▼───┐
-          │  VPS   │  │  Mac   │
-          │ agent  │  │ agent  │
-          └────────┘  └────────┘
+   git remote (bare repos on any host you like)
+        │
+        ├── hermes-skills.git ──►  $HERMES_HOME/skills      (worktree = live dir)
+        ├── hermes-memory.git ──►  $HERMES_HOME/memories    (worktree = live dir)
+        └── hermes-state.git  ──►  $HERMES_HOME/mesh-state  (heartbeats)
+
+   every machine runs the same loop, every 15 minutes:
+        commit local changes → pull --rebase --autostash → push
 ```
 
-Every 15 minutes, each machine pulls the latest, merges its own additions, and pushes back. If two machines edited the same fact differently, the LLM sorts it out.
+- **One copy.** A delete is a commit, never a side effect of someone's stale tree.
+- **Conflicts are surfaced, not resolved.** A rebase conflict aborts, logs
+  `CONFLICT`, and leaves that repo unpushed for the agent or the human to fix. No
+  path ever picks a side, and no path ever uses `--force`.
+- **No LLM in the loop.** Sync costs nothing and cannot be broken by a model being
+  unavailable.
+- **Live directories are converted in place** with `git init --separate-git-dir`,
+  so migrating an existing machine needs no copying and nothing has to be reconciled.
 
 ---
 
@@ -54,142 +69,138 @@ Every 15 minutes, each machine pulls the latest, merges its own additions, and p
 
 | Syncs | Stays local |
 |---|---|
-| `skills/` — all your Hermes skills | `.env`, `auth.json` |
-| Agent memory — facts, preferences, conventions | `state.db`, `sessions/` |
-| User profile — who you are, your style | `logs/`, `cron/` |
-| The scripts themselves — self-updating | Machine-specific memory (tagged) |
+| `skills/` — the whole agent skill tree | `.env`, `auth.json` |
+| `MEMORY.md` / `USER.md` — durable memory and user profile | `state.db`, `sessions/` |
+| Heartbeats (`mesh-state`, one branch per machine) | `logs/`, `cron/` |
 | | Secrets, OAuth tokens, API keys |
 
+Every worker sees **the same memory** — 2.x has no per-machine filtering.
+
 ---
 
-## 🏷️ Machine tagging
+## 🚀 Install
 
-Tag facts to specific machines — untagged entries are seen by everyone:
+There is **no installer for 2.x yet**: `setup.sh` still installs the 1.x
+architecture, so do not run it against a 2.x fleet. Installing a worker is five
+steps.
 
-```markdown
-⟨machine:macbook⟩ Project path: /Users/nick/dev/project-x
-⟨machine:workpc⟩  Project path: C:\Users\nick\work\project-x
-This preference applies everywhere — no tag needed
+```bash
+# 0. back up what you have
+tar czf ~/pre-mesh-v2-$(date +%F).tar.gz -C ~/.hermes skills memories
+
+# 1. convert the live dirs into worktrees, in place
+mkdir -p ~/.hermes/git
+git init -q --separate-git-dir ~/.hermes/git/skills.git -b main -- ~/.hermes/skills
+git init -q --separate-git-dir ~/.hermes/git/memory.git -b main -- ~/.hermes/memories
+
+# 2. ignore per-machine bookkeeping, commit, attach the remote, push
+cd ~/.hermes/skills
+printf '%s\n' .usage.json .curator_state .curator_ledger.jsonl \
+  .bundled_manifest .hub/ .locks/ '*.lock' > .gitignore
+git add -A && git commit -m "initial skills tree"
+git remote add origin <user>@<hub>:/path/to/hermes-skills.git
+git push -u origin main
+
+# 3. same for ~/.hermes/memories (ignore *.lock), then clone the state repo
+git clone <user>@<hub>:/path/to/hermes-state.git ~/.hermes/mesh-state
+
+# 4. install the loop
+install -Dm755 mesh-v2/mesh-sync.sh ~/.hermes/bin/mesh-sync.sh
+printf 'MACHINE="%s"\n' "$(hostname)" > ~/.hermes/mesh.conf
+
+# 5. schedule it
+( crontab -l 2>/dev/null; \
+  echo '*/15 * * * * ~/.hermes/bin/mesh-sync.sh >/dev/null 2>&1' ) | crontab -
 ```
 
----
+A bare repo must have `HEAD -> refs/heads/main`
+(`git --git-dir=<bare> symbolic-ref HEAD refs/heads/main`), otherwise `git clone`
+produces an empty worktree and only the `remote HEAD refers to nonexistent ref`
+warning says so.
 
-## 🤖 Commands
-
-| Command | What it does |
-|---|---|
-| `bash setup.sh` | Interactive setup — 9 friendly questions, zero flags |
-| `bash sync.sh` | Manual sync cycle (cron runs this automatically) |
-| `bash sync.sh --force-push` | Overwrite bare repo with local (step 1 of 2 for conflict resolution) |
-| `bash sync.sh --force-pull` | Overwrite local with bare repo (step 2 of 2 for conflict resolution) |
-| `bash sync.sh --resolve-skills` | Auto-resolve skill conflicts by keeping local versions (then force-pull other machines) |
-| `bash sync.sh --dry-run` | Preview what would change without modifying anything |
-| `bash sync.sh --squash` | Collapse >50 commits into one (run monthly to keep history clean) |
-| `bash update.sh` | Pull latest scripts from upstream — shows version diff + recent CHANGELOG entries before asking |
-| `bash test.sh` | Run the test suite (47 tests: setup, merge, sync, uninstall, edge cases) |
-| `bash uninstall.sh` | Remove everything cleanly — keeps your `skills/` and `memories/` |
+`mesh-sync.sh` reads `MACHINE` from `~/.hermes/mesh.conf`; everything else comes
+from each worktree's own remote.
 
 ---
 
-## 🔧 Config
+## 💾 Memory model
 
-`config.toml` never leaves your machine (it's gitignored). A clean template lives at `config.example.toml`:
+`MEMORY.md` and `USER.md` are one shared file, identical on every worker. Hermes
+caps them at **2,200** and **1,375** characters, so they hold top facts only —
+depth belongs in skills, which sync the same way and have no cap. Secrets belong in
+neither; they live in the Hermes env file.
 
-```toml
-enabled = true
-machine_name = "macbook"               # unique per machine
-hermes_home = "~/.hermes"
-role = "worker"                        # "coordinator" or "worker"
-bare_repo = ""                         # coordinator only
-upstream = "https://github.com/B1Z0N/hermes-mesh.git"
+---
 
-[scheduler]
-interval_minutes = 15
+## 🩺 Liveness
+
+`mesh-state` holds one branch per machine (`state/<hostname>`), force-pushed at most
+hourly, so heartbeats can never race or conflict with each other:
+
+```bash
+git -C ~/.hermes/mesh-state fetch -q origin
+git -C ~/.hermes/mesh-state for-each-ref \
+  --format='%(refname:short) %(committerdate:relative)' refs/remotes/origin/state/
 ```
+
+A branch older than a couple of hours means that machine is not syncing. Under 1.x
+this failure ran silently for two weeks on a live machine, which is why heartbeats
+exist.
+
+---
+
+## 🔧 Differences from 1.x
+
+| | 1.x | 2.x |
+|---|---|---|
+| Live files | duplicated, mirrored with `rsync --delete` | are the git worktrees |
+| Deletions | propagate from stale trees | are explicit commits |
+| Conflicts | local wins; LLM merges memory | abort + report, resolved by hand |
+| Force modes | `--force-pull`, `--force-push`, `--squash`, `--resolve-skills` | none |
+| Memory merge | `memory-merge.py`, content-keyed, one LLM call per conflict | git's own 3-way merge |
+| Machine tags | `⟨machine:X⟩` filtering per host | removed — one shared memory |
+| Bookkeeping | tracked, committed every cycle on every machine | gitignored |
+| `rsync` | required | **not used** (closes upstream issue #1) |
+| Liveness | a log line nobody reads | per-machine heartbeat branches |
 
 ---
 
 ## 📦 Requirements
 
-`setup.sh` checks everything before it starts:
-
-- **Python 3.8+** (with `tomli` if < 3.11 — setup tells you exactly what to install)
-- **Git** — any modern version
-- **SSH** — workers need key access to coordinator
-- **A scheduler** — a running **cron** daemon, or **systemd user timers**, on Linux; **launchd** on macOS (built-in). Setup detects which one will actually fire and installs accordingly; a `crontab` binary alone is not treated as proof that anything runs.
+- `git`, and SSH access to the hub from every worker (one key per machine).
+- Any cron — cronie, cron, or a systemd timer; the loop is a single script.
+- No `rsync`, no Python dependency, no LLM calls.
 
 ---
 
-## 🩺 Health check
+## 🔄 Updating and uninstalling
 
-```bash
-grep -E 'HEALTH|WARNING|SKILL CONFLICTS' ~/.hermes/logs/knowledge-sync.log
-```
-
-Every sync cycle prints a `HEALTH: OK` line. Warnings tell you exactly what needs attention.
-
-Warnings worth acting on immediately:
-
-| Warning | Meaning |
-|---|---|
-| `memory-drop-prevented:FILE/local(n)` / `FILE/remote(n)` | The merge tried to delete `n` entries that existed on that machine / on the hub. They were restored. |
-| `memory-guard-failed:FILE` | The guard could not run; live memory was left untouched rather than overwritten. |
-| `skill-drift:N` | Live and worktree skill trees differ after import. |
-| `fetch-failed` / `push-failed` | SSH/auth or reachability — the coordinator is unreachable. |
+- **Update:** `mesh-sync.sh` is one file — copy a new one over
+  `~/.hermes/bin/mesh-sync.sh`. Skills and memory update themselves.
+- **Uninstall:** remove the crontab line; to get the old layout back, restore the
+  step-0 tarball. Nothing in 2.x deletes anything.
 
 ---
 
-## 🔄 Updates
+## 🧪 Known gaps
 
-When the new version is released you can run `update.sh`:
-
-```
-GitHub → coordinator pulls (update.sh) → pushes to bare repo → workers pick it up next tick
-```
-
----
-
-## 🧹 Uninstall
-
-```bash
-cd ~/hermes-mesh && bash uninstall.sh
-```
-
-Removes: worktree, bare repo (if coordinator), scheduler, logs, backups.  
-Keeps: `~/.hermes/skills/` and `~/.hermes/memories/` — your knowledge is yours.
+- No 2.x installer; install is the manual sequence above.
+- `test.sh` and `tests/` cover the 1.x pipeline only.
+- Conflicts are manual by design — that is the trade for never losing data.
 
 ---
 
 ## 🔒 Security note
 
-The one-liner `curl | bash` fetches over HTTPS (TLS). For defense-in-depth, pin to a specific commit SHA — the content at a pinned URL is immutable, though the URL itself needs updating when `setup.sh` changes:
+Memory is shared with **every** machine in the fleet, and its git history is
+permanent. Never put API keys, passwords or tokens in `MEMORY.md`, `USER.md` or a
+skill: key them in the Hermes env file. If one lands in a synced file, scrub it from
+history rather than only deleting the line.
 
-```bash
-# Pin to a specific commit (copy the ?at= URL from GitHub — press 'y' in the file view):
-curl -sSL https://raw.githubusercontent.com/B1Z0N/hermes-mesh/e92f43e/setup.sh | bash
+---
 
-# Or clone a release tag:
-git clone --branch v1.0.1 https://github.com/B1Z0N/hermes-mesh.git
-cd hermes-mesh && bash setup.sh
-```
+## 📄 Licence and credit
 
-## 🧪 Development
-
-```bash
-bash test.sh           # 47 tests: setup, merge, sync, uninstall, edge cases
-bash test.sh merge     # run only merge tests (incl. fixture-based LLM fallback tests)
-```
-
-CI runs on every push and PR via GitHub Actions: shellcheck, Python syntax + import + lint (ruff), and the full test suite. See [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
-
-Versioning follows [Keep a Changelog](https://keepachangelog.com/). Release tags (`v1.0.1`, etc.) are created on the main branch. See [`CHANGELOG.md`](CHANGELOG.md) for what changed between versions.
-
-## 📐 Architecture decisions
-
-- **Export before import** — local edits are never destroyed by a stale remote copy
-- **No silent failures** — every error is captured to the log with diagnostics
-- **Skills conflicts** — warn in red with `--resolve-skills` / `--force-pull` hint, don't block, local version wins. Run `sync.sh --resolve-skills` to suppress warnings and auto-accept local versions, then `--force-pull` on other machines. Use `--dry-run` to preview what would be lost before syncing.
-- **Three-way memory merge** — `§`-entry diffing, LLM only when both sides disagree
-- **Coordinator SPOF** — workers degrade gracefully (warn + continue), but skills/memory drift until coordinator returns. Run a coordinator on an always-on machine.
-- **LLM conflicts** — sequential, 120s timeout per conflict. Worst case N × 120s. In practice, conflicts are rare (only when both sides edit the same entry differently).
-- **Git history** — every sync cycle creates a commit. Run `sync.sh --squash` periodically (e.g. monthly) to collapse history noise.
+MIT © 2026 [B1Z0N](https://github.com/B1Z0N). This fork keeps the original licence
+and the full 1.x history; 2.0 is a rewrite of the sync engine, not a different
+project.
