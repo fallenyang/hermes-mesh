@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.0.0 — 2026-11-18
+
+Architecture change: one copy of every file, git as the only transport.
+
+### Removed
+- `rsync` export/import mirroring of the live tree and the worktree. This was the
+  data-loss path: a worker with a stale tree deleted newer hub files, and the
+  conflict detector could not see it because it only inspected the current cycle.
+- `--force-pull`, `--force-push`, `--squash`, `--resolve-skills`.
+- The LLM three-way memory merge (`memory-merge.py`) and both drop guards. Keying
+  entries by content made a patch look like delete+add, so the guard re-added
+  superseded text and memory grew unbounded (13 entries -> 38, 8.2 kB against a
+  2,200-char limit).
+- Tracked per-machine bookkeeping (`.usage.json`, `.curator_state`,
+  `.curator_ledger.jsonl`, `.bundled_manifest`, `.hub/`, `.locks/`).
+
+### Added
+- `mesh-v2/mesh-sync.sh`: commit, `pull --rebase --autostash`, push with backoff;
+  conflicts abort and are reported, never resolved by picking a side.
+- `$HERMES_HOME/skills` and `$HERMES_HOME/memories` are the git worktrees
+  themselves (`--separate-git-dir`), so there is no second copy to mirror.
+- `hermes-state.git` heartbeats on one branch per machine, so liveness cannot be
+  lost silently.
+- Per-machine filtering is gone: every worker sees the same memory.
+
 ## 1.1.1 — 2026-11-03
 
 Field fix, found while rolling 1.1.0 across a four-machine fleet.

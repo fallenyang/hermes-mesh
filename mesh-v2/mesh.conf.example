@@ -1,0 +1,2 @@
+# Sourced by mesh-sync.sh. One line per machine.
+MACHINE="hostname-here"
